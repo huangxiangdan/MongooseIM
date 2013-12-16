@@ -33,6 +33,7 @@
 	 loop/1,
 	 stop/1,
 	 store_packet/3,
+   import/3,
 	 resend_offline_messages/2,
 	 pop_offline_messages/3,
 	 get_sm_features/5,
@@ -48,6 +49,12 @@
 -include("jlib.hrl").
 -include("ejabberd_http.hrl").
 -include("ejabberd_web_admin.hrl").
+
+-record(mysql_result,
+  {fieldinfo=[],
+   rows=[],
+   affectedrows=0,
+   error=""}).
 
 -record(offline_msg, {us, timestamp, expire, from, to, packet}).
 
@@ -653,3 +660,72 @@ webadmin_user_parse_query(_, "removealloffline", User, Server, _Query) ->
     end;
 webadmin_user_parse_query(Acc, _Action, _User, _Server, _Query) ->
     Acc.
+
+
+import(User, Pass, LServer) ->
+    {ok, Pid} = mysql_conn:start("localhost", 3306, User, Pass, "ejabberd", undefined),
+    mysql_conn:fetch(Pid, ["set names 'utf8';"], self()),
+    {data, MySQLResult} = mysql_conn:fetch(Pid, "select username, xml from spool where xml not like '%extra%';", self()),
+    BServer = list_to_binary(LServer),
+    lists:foreach(fun([LUser, XML]) -> 
+      try parse_xml([LUser, XML], BServer) of
+        Offline -> 
+          ?INFO_MSG("offline messages: ~p", [Offline]),
+          F = fun() -> mnesia:write(Offline) end,
+          mnesia:transaction(F)
+      catch A:B -> ?ERROR_MSG("xml messages:A ~p, B ~p, ~p", [A, B, XML])
+      end
+    end, MySQLResult#mysql_result.rows).
+
+-spec string_to_jid(binary()) -> jid() | error.
+
+string_to_jid(S) ->
+    string_to_jid1(binary_to_list(S), "").
+
+string_to_jid1([$@ | _J], "") -> error;
+string_to_jid1([$@ | J], N) ->
+    string_to_jid2(J, lists:reverse(N), "");
+string_to_jid1([$/ | _J], "") -> error;
+string_to_jid1([$/ | J], N) ->
+    string_to_jid3(J, "", lists:reverse(N), "");
+string_to_jid1([C | J], N) ->
+    string_to_jid1(J, [C | N]);
+string_to_jid1([], "") -> error;
+string_to_jid1([], N) ->
+    jlib:make_jid(<<"">>, list_to_binary(lists:reverse(N)), <<"">>).
+
+%% Only one "@" is admitted per JID
+string_to_jid2([$@ | _J], _N, _S) -> error;
+string_to_jid2([$/ | _J], _N, "") -> error;
+string_to_jid2([$/ | J], N, S) ->
+    string_to_jid3(J, N, lists:reverse(S), "");
+string_to_jid2([C | J], N, S) ->
+    string_to_jid2(J, N, [C | S]);
+string_to_jid2([], _N, "") -> error;
+string_to_jid2([], N, S) ->
+    jlib:make_jid(list_to_binary(N), list_to_binary(lists:reverse(S)), <<"">>).
+
+string_to_jid3([C | J], N, S, R) ->
+    string_to_jid3(J, N, S, [C | R]);
+string_to_jid3([], N, S, R) ->
+    jlib:make_jid(list_to_binary(N), list_to_binary(S),
+             list_to_binary(lists:reverse(R))).
+
+parse_xml([LUser, XML], LServer) ->
+    El = #xmlel{} = xml_stream:parse_element(XML),
+    From = #jid{} = string_to_jid(
+                      xml:get_attr_s(<<"from">>, El#xmlel.attrs)),
+    To = #jid{} = string_to_jid(
+                    xml:get_attr_s(<<"to">>, El#xmlel.attrs)),
+    Stamp = xml:get_path_s(El, [{elem, <<"delay">>},
+                                {attr, <<"stamp">>}]),
+    TS = case jlib:datetime_string_to_timestamp(Stamp) of
+             {_, _, _} = Now ->
+                 Now;
+             undefined ->
+                 now()
+         end,
+    Expire = find_x_expire(TS, El#xmlel.children),
+    #offline_msg{us = {LUser, LServer},
+                 from = From, to = To,
+                 timestamp = TS, expire = Expire, packet = El}.
